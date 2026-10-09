@@ -279,7 +279,7 @@ runtime 内部需要保留更多控制信息，
 start:
   context.messages.push(partial assistant)
 
-delta:
+delta（增量）:
   替换 context 里最后一条 partial assistant
 
 done/error:
@@ -317,13 +317,145 @@ const changes = getToolStateChanges(
 );
 ```
 
+>declareToolChanges() 会根据当前历史上下文 + 即将加入上下文的消息，
+>重放 system message 里的 toolsAdded/toolsRemoved，
+>推断“模型当前已经被声明可用的工具集合”。
+>
+>然后它把这个集合和 runtime 当前真实可执行的全量工具集合做对比，
+>得到工具增量变化：新增、删除、或定义变更。
+>
+>最后把这些变化写进一条 system message，
+>让下一次模型请求能看到最新工具状态。
+
 为什么不每次都重新塞完整工具列表：
 
-```text
-因为 transcript 是可重放的。
-工具集合变化可以作为增量历史记录。
-session replay 时，看到 toolsAdded/toolsRemoved 就能恢复当时模型可见的工具状态。
-```
+>你这个问题问到设计点了。答案是：**可以直接拼全量工具，但 Pi 选择“增量声明 + replay”，主要不是为了快，而是为了 transcript 可重放、可持久化、可审计、少污染上下文。**
+>
+>如果每次都直接拼本地全量工具，大概是：
+>
+>```
+>每次请求前：
+>system.tools = runtime 当前所有 tools
+>```
+>
+>这样确实简单。但会有几个问题。
+>
+>**1. transcript 不能自解释**
+>
+>Pi 的 session/transcript 不是只服务当前这一次请求，还要能被保存、恢复、重放。
+>
+>如果工具只存在本地 runtime 里，而 transcript 里没有记录工具何时出现、何时删除，那么以后重放这段历史时就不知道：
+>
+>```
+>当时模型能调用哪些工具？
+>为什么它能调用 read？
+>为什么后来又能调用 bash？
+>某个 toolCall 在当时是否合法？
+>```
+>
+>`toolsAdded/toolsRemoved` 把工具状态变化写进 transcript，历史自己就能解释自己。
+>
+>**2. 工具是随时间变化的，不是固定常量**
+>
+>工具集合可能会变：
+>
+>```
+>extension 加载/卸载
+>模式切换
+>权限变化
+>只读模式
+>某些工具临时禁用
+>模型/环境变化
+>```
+>
+>如果只看“当前本地工具列表”，你无法知道历史上某个时刻工具集合是什么。
+>
+>增量声明可以表达：
+>
+>```
+>一开始只有 read
+>后来加了 edit
+>后来移除了 bash
+>后来 edit schema 变了
+>```
+>
+>**3. provider payload 更干净**
+>
+>如果每次都塞全量工具，系统消息会重复携带大量工具定义。
+>
+>工具 schema 往往很大，尤其是带 JSON schema 的 tool declaration。每次重复拼进去会增加：
+>
+>```
+>上下文 token
+>请求体大小
+>缓存失效概率
+>provider 处理成本
+>```
+>
+>增量方式只在变化时注入：
+>
+>```
+>没变化 → 不加 system message
+>有变化 → 只加差异
+>```
+>
+>**4. 支持中途工具变更**
+>
+>Pi 支持 mid-conversation system message。也就是说，工具可以在对话中途变化。
+>
+>这套设计不是：
+>
+>```
+>每次请求都用当前 tools 覆盖一切
+>```
+>
+>而是：
+>
+>```
+>transcript 里记录工具变化
+>provider 侧根据 transcript replay 出当前工具状态
+>```
+>
+>更适合长会话、分支、恢复。
+>
+>**5. 避免 runtime 和 transcript 脱节**
+>
+>Agent Loop 内部真正执行工具靠：
+>
+>```
+>context.tools
+>```
+>
+>模型能看到哪些工具靠：
+>
+>```
+>system message 里的 toolsAdded/toolsRemoved
+>```
+>
+>`declareToolChanges()` 的职责就是保证这两者同步。
+>
+>如果只“直接拼本地工具”，那 transcript 本身不记录变化，模型请求当下可能没问题，但 session 历史失去了工具状态来源。
+>
+>一句话：
+>
+>```
+>直接拼全量工具适合 demo；增量声明适合可恢复、可重放、可持久化的 Agent runtime。
+>```
+>
+>可以类比 Git：
+>
+>```
+>直接拼全量工具 = 每次都保存当前最终文件快照。
+>toolsAdded/toolsRemoved = 保存每次变更的 diff。
+>```
+>
+>Pi 需要的不只是“这次请求能跑”，还需要以后能解释：
+>
+>```
+>这段对话当时发生了什么，模型当时知道什么，工具当时是什么状态。
+>```
+>
+>
 
 ## Tool Calling 的完整链路
 

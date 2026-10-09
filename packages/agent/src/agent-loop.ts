@@ -1,6 +1,8 @@
 /**
  * Agent loop that works with AgentMessage throughout.
  * Transforms to Message[] only at the LLM call boundary.
+ * 整个 Agent 循环内部始终使用 AgentMessage。
+ * 只有在调用大模型的边界处，才将其转换成 Message[]。
  */
 
 import {
@@ -34,6 +36,11 @@ export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
  */
+/**
+ * 使用一条新的提示消息启动 Agent 循环。
+ * 该提示消息会被添加到上下文中，
+ * 同时会为这条消息触发并发送相应的事件。
+ */
 export function agentLoop(
 	prompts: AgentMessage[],
 	context: AgentContext,
@@ -42,7 +49,9 @@ export function agentLoop(
 	streamFn: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	const stream = createAgentStream();
-
+	//启动一个异步的 runAgentLoop，但当前代码不等待它执行完；
+	// 运行过程中不断把事件塞进 stream，最终执行完成后把结果
+	// 交给 stream.end()
 	void runAgentLoop(
 		prompts,
 		context,
@@ -66,6 +75,17 @@ export function agentLoop(
  * **Important:** The last message in context must convert to a `user` or `toolResult` message
  * via `convertToLlm`. If it doesn't, the LLM provider will reject the request.
  * This cannot be validated here since `convertToLlm` is only called once per turn.
+ */
+/**
+ * 从当前上下文继续执行 Agent 循环，不添加新的消息。
+ * 主要用于重试场景，因为上下文中已经包含用户消息或工具执行结果。
+ *
+ * 重要：上下文中的最后一条消息必须能够通过 `convertToLlm`
+ * 转换为 `user`（用户消息）或 `toolResult`（工具执行结果）类型。
+ * 如果无法转换，大模型服务提供商将拒绝此次请求。
+ *
+ * 这里无法提前验证这一条件，因为 `convertToLlm`
+ * 在每轮执行过程中只会调用一次。
  */
 export function agentLoopContinue(
 	context: AgentContext,
@@ -194,13 +214,23 @@ async function runLoop(
 			if (lastCompletedTurn) {
 				// 每完成一次模型响应后，运行时都有机会重写“下一次请求”的准备状态。
 				// 典型例子：上下文太长时做 compaction，或根据上一轮结果切换模型/思考级别。
+				// 语法：config.prepareNextTurn?. 如果存在config.prepareNextTurn这个变量就调用lastCompletedTurn，不存在就直接返回undefined
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
 				if (nextTurnSnapshot) {
+					// ?? 是 JavaScript/TypeScript 的 空值合并运算符
+					// 如果 nextTurnSnapshot.context 不是 null 或 undefined，就使用它；否则继续使用原来的 currentContext
 					currentContext = nextTurnSnapshot.context ?? currentContext;
 					preparedMessages = nextTurnSnapshot.messages ?? [];
 					config = {
-						...config,
+						...config,  // ...展开运算符
+						// 如果下一轮指定了模型，就换模型，否则继续用原模型
 						model: nextTurnSnapshot.model ?? config.model,
+						// 如果没指定 thinkingLevel
+						//     → 保持原 reasoning
+						// 如果明确指定 off
+						//     → 关闭 reasoning
+						// 否则
+						//     → 使用新的 thinkingLevel
 						reasoning:
 							nextTurnSnapshot.thinkingLevel === undefined
 								? config.reasoning
@@ -282,6 +312,7 @@ async function runLoop(
 				// every tool call in the message may carry truncated arguments. Fail
 				// them all instead of executing potentially borked calls.
 				const executedToolBatch =
+				// 模型输出被截断了，不执行工具：因为可能参数不完整，是错的
 					message.stopReason === "length"
 						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
 						: await executeToolCalls(currentContext, message, config, signal, emit);
@@ -319,6 +350,8 @@ async function runLoop(
 
 		// 内层循环结束说明：当前没有工具要继续执行，也没有 steering 消息要插队。
 		// 这时 Agent 本来会结束；follow-up 是“用户在结束边界追加的新任务”。
+		// steering: Agent 正在跑时，用户插队影响当前运行。
+		// follow-up: Agent 刚要停下时，用户追加下一条任务。
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
@@ -545,8 +578,10 @@ async function executeToolCalls(
 	// 只要全局配置要求顺序执行，或任意一个工具声明自己必须顺序执行，
 	// 整个批次就按顺序跑。这样可以避免 edit/write/bash 这类有副作用工具互相踩状态。
 	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
+		//串行调用工具
 		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
 	}
+	// 并行调用工具
 	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
 }
 
@@ -576,6 +611,7 @@ async function executeToolCallsSequential(
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		let finalized: FinalizedToolCallOutcome;
+		// immediate 立即
 		if (preparation.kind === "immediate") {
 			finalized = {
 				toolCall,
@@ -801,6 +837,8 @@ async function prepareToolCall(
 			args: validatedArgs,
 		};
 	} catch (error) {
+		//遇到失败不是直接throw exception，而是写成tool result返回给模型做决策（下次是重试，还是换方案）
+		// 这就是 Coding Agent 和普通函数调用的区别。
 		return {
 			kind: "immediate",
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
@@ -821,13 +859,15 @@ async function executePreparedToolCall(
 		// execute 的第四个参数是工具进度回调。这里不直接 await 每次 update，
 		// 而是收集 promise，保证工具执行不被 UI/事件消费者的速度拖慢。
 		const result = await prepared.tool.execute(
-			prepared.toolCall.id,
+			prepared.toolCall.id, // 真正带参数执行tool的地方
 			prepared.args as never,
 			signal,
 			(partialResult) => {
 				if (!acceptingUpdates) return;
 				updateEvents.push(
+					//这里没有每次 update 都直接阻塞工具执行，而是收集 promise：
 					Promise.resolve(
+						// tool_execution_update 是进度回调
 						emit({
 							type: "tool_execution_update",
 							toolCallId: prepared.toolCall.id,
@@ -845,6 +885,7 @@ async function executePreparedToolCall(
 	} catch (error) {
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);
+		// 同tool prepare阶段，遇到问题不是throw exception
 		return {
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 			isError: true,
